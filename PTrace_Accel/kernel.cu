@@ -1,17 +1,21 @@
-
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include <curand_kernel.h>
 
-
-#include "hittable_list.h"
-#include "sphere.h"
-#include "color.h"
+#include <time.h>
 #include <iostream>
-#include "camera.h"
-#include "PMath.h"
-#include "material.h"
+#include "vec3.h"
 #include <SDL.h>
 #undef main
+
+#define checkCudaErrors(val) check_cuda((val), #val, __FILE__, __LINE__)
+
+void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line);
+
+
+void updateTexture(SDL_Texture* texture);
+
+__global__ void render(vec3* dev_pixels, int width, int height);
 
 
 const int WIDTH = 2000, HEIGHT = 1000;
@@ -20,13 +24,9 @@ unsigned int aa = 16;
 
 int max_depth = 4;
 
-Uint32* pixels;
-SDL_Renderer* renderer;
-SDL_Texture* texture;
+int tx = 8;
+int ty = 8;
 
-void updateTexture(const hittable_list& scene, camera& cam);
-
-vec3 ray_color(const ray& r, const hittable_list& scene, int depth);
 
 int main()
 {
@@ -40,26 +40,22 @@ int main()
         return EXIT_FAILURE;
     }
 
+    SDL_Renderer* renderer;
+    SDL_Texture* texture;
+
     renderer = SDL_CreateRenderer(window, -1, 0);
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, WIDTH, HEIGHT);
 
-    pixels = new Uint32[WIDTH * HEIGHT];
-
-
-    camera cam;
-
-    hittable_list scene;
-
-    scene.add(std::make_shared<sphere>(vec3(0, 0, -1.0), 0.5, std::make_shared<lambertian>(vec3(0.7, 0.3, 0.0))));
+    /*scene.add(std::make_shared<sphere>(vec3(0, 0, -1.0), 0.5, std::make_shared<lambertian>(vec3(0.7, 0.3, 0.0))));
 
     scene.add(std::make_shared<sphere>(vec3(1.0, 0, -1.0), 0.5, std::make_shared<metal>(vec3(0.8, 0.6, 0.2), 0.3)));
 
     scene.add(std::make_shared<sphere>(vec3(-1.0, 0, -1.0), 0.5, std::make_shared<metal>(vec3(0.8, 0.8, 0.0), 1.0)));
 
-    scene.add(std::make_shared<sphere>(vec3(0, -100.5, 0), 100, std::make_shared<lambertian>(vec3(0.8, 0.8, 0.0))));
+    scene.add(std::make_shared<sphere>(vec3(0, -100.5, 0), 100, std::make_shared<lambertian>(vec3(0.8, 0.8, 0.0))));*/
 
 
-    updateTexture(scene, cam);
+    updateTexture(texture);
 
 
     SDL_Event windowEvent;
@@ -73,7 +69,7 @@ int main()
             if (windowEvent.type == SDL_KEYDOWN) {
                 switch (windowEvent.key.keysym.sym) {
                 case SDLK_RETURN:
-                    updateTexture(scene, cam);
+                    updateTexture(texture);
                     break;
                 }
             }
@@ -85,7 +81,6 @@ int main()
 
     }
 
-    delete[] pixels;
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
 
@@ -95,49 +90,55 @@ int main()
     return EXIT_SUCCESS;
 }
 
-void updateTexture(const hittable_list& scene, camera& cam) {
-    for (int y = 0; y < HEIGHT; y++) {
-        std::cout << "scanlines left: " << HEIGHT - y << std::endl;
-        for (int x = 0; x < WIDTH; x++) {
+void updateTexture(SDL_Texture* texture) {
+    
+    vec3* pixels;
 
-            vec3 color;
-            for (int s = 0; s < aa; s++) {
-                auto u = double(x + random_double()) / WIDTH;
-                auto v = double(y + random_double()) / HEIGHT;
-                ray r = cam.get_ray(u, v);
+    pixels = new vec3[WIDTH * HEIGHT];
 
-                hit_record rec;
+    checkCudaErrors(cudaMallocManaged((void**)&pixels, WIDTH * HEIGHT * sizeof(vec3)));
+    
 
-                color += ray_color(r, scene, max_depth);
-            }
-            pixels[y * WIDTH + x] = color.to_color(aa).getColor();
-        }
-    }
-    std::cout << "All done!" << std::endl;
-    SDL_UpdateTexture(texture, NULL, pixels, WIDTH * sizeof(Uint32));
+    clock_t start, stop;
+    start = clock();
+
+
+    dim3 blocks(WIDTH / tx + 1, HEIGHT / ty + 1);
+    dim3 threads(tx, ty);
+
+    render <<<blocks, threads >>>(pixels, WIDTH, HEIGHT);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+    
+    stop = clock();
+    
+    double timer_seconds = ((double)(stop - start)) / CLOCKS_PER_SEC;
+
+    std::cerr << "took " << timer_seconds << " seconds.\n";
+
+
+    Uint32* fb = new Uint32[WIDTH * HEIGHT];
+
+    //magic vec3 to uint32
+    for (int i = 0; i < WIDTH * HEIGHT; i++) fb[i] = 0x000000FF | uint8_t(255.99 * pixels[i].e[0]) | uint8_t(255.99 * pixels[i].e[1]) << 8 | uint8_t(255.99 * pixels[i].e[2]) << 16;
+
+    SDL_UpdateTexture(texture, NULL, fb, WIDTH * sizeof(Uint32));
 }
 
-vec3 ray_color(const ray& r, const hittable_list& scene, int depth)
-{
-    if (depth <= 0)return vec3();
+__global__ void render(vec3* d_pixels, int width, int height) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
 
-    hit_record rec;
-
-    if (scene.hit(r, 0.001, INFINITY, rec)) {
-        ray scattered;
-        vec3 attenuation;
-        if (rec.mat_ptr->scatter(r, rec, attenuation, scattered)) {
-            if (scattered.d == vec3()) {
-                return attenuation;
-            }
-            return attenuation * ray_color(scattered, scene, depth - 1);
-        }
-        return vec3();
-
-    }
-    return ray_to_background(r);
+    if (i >= width || j >= height) return;
+    int pixelIndex = j * width + i;
+    d_pixels[pixelIndex] = vec3(float(i) / width, float(j) / height, 0.2f);
 }
 
+void check_cuda(cudaError_t result, char const* const func, const char* const file, int const line) {
+    if (result) {
+        std::cerr << "CUDA Error: " << static_cast<unsigned int>(result) << " at " << file << ":" << line << " '" << func << "' \n";
 
-
-
+        cudaDeviceReset();
+        exit(99);
+    }
+}

@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+
 class color{
 public:
 	color(uint32_t e) {
@@ -8,6 +9,10 @@ public:
 
 	color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 		e = r | (g << 8) | (b << 16) | (a << 24);
+	}
+
+	color(float r, float g, float b, float a) {
+		
 	}
 
 	uint8_t getR() { return (e & 0xFF000000) >> 24; }
@@ -28,27 +33,11 @@ public:
 		e |= b << 16;
 	}
 	void setA(uint8_t a) {
-		e &= 0x00FFFF00;
+		e &= 0xFFFFFF00;
 		e |= a << 24;
 	}
 
 	uint32_t getColor() { return e; }
-
-	color operator + (color c) {
-		return color(getR() + c.getR(), getG() + c.getG(), getB() + c.getB(), getA() + c.getA());
-	}
-
-	color operator - (color c) {
-		return color(getR() - c.getR(), getG() - c.getG(), getB() - c.getB(), getA() - c.getA());
-	}
-
-	color operator * (color c) {
-		return color(getR() * c.getR(), getG() * c.getG(), getB() * c.getB(), getA() * c.getA());
-	}
-
-	color operator / (color c) {
-		return color(getR() / c.getR(), getG() / c.getG(), getB() / c.getB(), getA() / c.getA());
-	}
 
 
 private:
