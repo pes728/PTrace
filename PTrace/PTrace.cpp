@@ -11,7 +11,7 @@
 
 const int WIDTH = 2000, HEIGHT = 1000;
 
-unsigned int aa = 16;
+unsigned int aa = 4;
 
 int max_depth = 4;
 
