@@ -1,17 +1,26 @@
 #pragma once
+#include "vec3.h"
 #include "ray.h"
+#include "PMath.h"
 
 
 class camera {
 public:
-	camera() {
-		lower_left_corner = vec3(-2.0, -1.0, -1.0);
-		horizontal = vec3(4.0, 0.0, 0.0);
-		vertical = vec3(0.0, 2.0, 0.0);
-		origin = vec3(0.0, 0.0, 0.0);
+	__device__ camera(vec3 lookfrom, vec3 lookat, vec3 vup, float vfov, float aspect) {
+		vec3 u, v, w;
+		float theta = vfov * pi / 180;
+		float half_height = tan(theta / 2);
+		float half_width = aspect * half_height;
+		origin = lookfrom;
+		w = unit_vector(lookfrom - lookat);
+		u = unit_vector(cross(vup, w));
+		v = cross(w, u);
+		lower_left_corner = origin - half_width * u - half_height * v - w;
+		horizontal = 2 * half_width * u;
+		vertical = 2 * half_height * v;
 	}
 
-	ray get_ray(double u, double v) const {
+	__device__ ray get_ray(double u, double v) const {
 		return ray(origin, lower_left_corner + u * horizontal + v * vertical - origin);
 	}
 

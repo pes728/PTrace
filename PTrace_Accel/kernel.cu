@@ -2,27 +2,45 @@
 #include "device_launch_parameters.h"
 #include <curand_kernel.h>
 
+#include "vec3.h"
+#include "ray.h"
+#include "sphere.h"
+#include "camera.h"
+#include "hittable_list.h"
+#include "material.h"
+
 #include <time.h>
 #include <iostream>
-#include "vec3.h"
+#include <float.h>
+#include <stdio.h>
+
 #include <SDL.h>
 #undef main
 
+
 #define checkCudaErrors(val) check_cuda((val), #val, __FILE__, __LINE__)
+
+#define num_objects 5
+
 
 void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line);
 
 
 void updateTexture(SDL_Texture* texture);
 
-__global__ void render(vec3* dev_pixels, int width, int height);
+__global__ void render_init(int width, int height, curandState* rand_state);
 
+__global__ void render(vec3* dev_pixels, int width, int height, int aa, camera** cam, hittable** world, curandState* rand_state);
+
+__global__ void createWorld(hittable** d_list, hittable** d_world, camera** d_camera, int width, int height);
+
+__device__ vec3 color(const ray& r, hittable** world, curandState* local_rand_state);
+
+__global__ void free_world(hittable** d_list, hittable** d_world, camera** d_camera);
 
 const int WIDTH = 2000, HEIGHT = 1000;
 
-unsigned int aa = 16;
-
-int max_depth = 4;
+unsigned int aa = 100;
 
 int tx = 8;
 int ty = 8;
@@ -45,15 +63,6 @@ int main()
 
     renderer = SDL_CreateRenderer(window, -1, 0);
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, WIDTH, HEIGHT);
-
-    /*scene.add(std::make_shared<sphere>(vec3(0, 0, -1.0), 0.5, std::make_shared<lambertian>(vec3(0.7, 0.3, 0.0))));
-
-    scene.add(std::make_shared<sphere>(vec3(1.0, 0, -1.0), 0.5, std::make_shared<metal>(vec3(0.8, 0.6, 0.2), 0.3)));
-
-    scene.add(std::make_shared<sphere>(vec3(-1.0, 0, -1.0), 0.5, std::make_shared<metal>(vec3(0.8, 0.8, 0.0), 1.0)));
-
-    scene.add(std::make_shared<sphere>(vec3(0, -100.5, 0), 100, std::make_shared<lambertian>(vec3(0.8, 0.8, 0.0))));*/
-
 
     updateTexture(texture);
 
@@ -92,12 +101,29 @@ int main()
 
 void updateTexture(SDL_Texture* texture) {
     
+    std::cerr << "Rendering a " << WIDTH<< "x" << HEIGHT << " image with " << aa << " samples per pixel ";
+    std::cerr << "in " << tx << "x" << ty << " blocks.\n";
+
+    int num_pixels = WIDTH * HEIGHT;
+
     vec3* pixels;
 
-    pixels = new vec3[WIDTH * HEIGHT];
-
-    checkCudaErrors(cudaMallocManaged((void**)&pixels, WIDTH * HEIGHT * sizeof(vec3)));
+    checkCudaErrors(cudaMallocManaged((void**)&pixels, num_pixels * sizeof(vec3)));
     
+    curandState* d_rand_state;
+    checkCudaErrors(cudaMalloc((void**)&d_rand_state, num_pixels * sizeof(curandState)));
+
+
+    hittable** d_list;
+    checkCudaErrors(cudaMalloc((void**)&d_list, num_objects));
+    hittable** d_world;
+    checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hittable*)));
+    camera** d_camera;
+    checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
+    createWorld <<<1, 1 >>> (d_list, d_world, d_camera, WIDTH, HEIGHT);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+
 
     clock_t start, stop;
     start = clock();
@@ -106,7 +132,11 @@ void updateTexture(SDL_Texture* texture) {
     dim3 blocks(WIDTH / tx + 1, HEIGHT / ty + 1);
     dim3 threads(tx, ty);
 
-    render <<<blocks, threads >>>(pixels, WIDTH, HEIGHT);
+    render_init <<<blocks, threads>>> (WIDTH, HEIGHT, d_rand_state);
+    checkCudaErrors(cudaGetLastError());
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    render <<<blocks, threads >>>(pixels, WIDTH, HEIGHT, aa, d_camera, d_world, d_rand_state);
     checkCudaErrors(cudaGetLastError());
     checkCudaErrors(cudaDeviceSynchronize());
     
@@ -123,15 +153,126 @@ void updateTexture(SDL_Texture* texture) {
     for (int i = 0; i < WIDTH * HEIGHT; i++) fb[i] = 0x000000FF | uint8_t(255.99 * pixels[i].e[0]) | uint8_t(255.99 * pixels[i].e[1]) << 8 | uint8_t(255.99 * pixels[i].e[2]) << 16;
 
     SDL_UpdateTexture(texture, NULL, fb, WIDTH * sizeof(Uint32));
+
+    checkCudaErrors(cudaDeviceSynchronize());
+    free_world <<<1, 1>>> (d_list, d_world, d_camera);
+    
+    checkCudaErrors(cudaFree(d_camera));
+    checkCudaErrors(cudaFree(d_world));
+    checkCudaErrors(cudaFree(d_list));
+    checkCudaErrors(cudaFree(d_rand_state));
+    checkCudaErrors(cudaFree(pixels));
+
+    cudaDeviceReset();
 }
 
-__global__ void render(vec3* d_pixels, int width, int height) {
+__global__ void render_init(int width, int height, curandState* rand_state)
+{
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int j = threadIdx.y + blockIdx.y * blockDim.y;
 
-    if (i >= width || j >= height) return;
+    if ((i >= width) || (j >= height)) return;
+
+    int pixel_index = j * width + i;
+
+    curand_init(1984, pixel_index, 0, &rand_state[pixel_index]);
+}
+
+__global__ void createWorld(hittable** d_list, hittable** d_world, camera** d_camera, int width, int height) {
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        d_list[0] = new sphere(vec3(0, 0, -1), 0.5,
+            new lambertian(vec3(0.1, 0.2, 0.5)));
+        d_list[1] = new sphere(vec3(0, -100.5, -1), 100,
+            new lambertian(vec3(0.8, 0.8, 0.0)));
+        d_list[2] = new sphere(vec3(1, 0, -1), 0.5,
+            new metal(vec3(0.8, 0.6, 0.2), 0.0));
+        d_list[3] = new sphere(vec3(-1, 0, -1), 0.5,
+            new dielectric(1.5));
+        d_list[4] = new sphere(vec3(-1, 0, -1), -0.45,
+            new dielectric(1.5));
+
+        *d_world = new hittable_list(d_list, num_objects);
+        *d_camera = new camera(vec3(-2, 2, 1), vec3(0, 0, -1), vec3(0, 1, 0), 20.0, float(width) / float(height));
+    }
+}
+
+__global__ void render(vec3* pixels, int width, int height, int aa, camera** cam, hittable** world, curandState* rand_state) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+
+    if ((i >= width) || (j >= height)) return;
+
     int pixelIndex = j * width + i;
-    d_pixels[pixelIndex] = vec3(float(i) / width, float(j) / height, 0.2f);
+    
+    curandState local_rand_state = rand_state[pixelIndex];
+
+    vec3 col;
+
+    for (int s = 0; s < aa; s++) {
+        float u = float(i + curand_uniform(&local_rand_state)) / float(width);
+        float v = float(j + curand_uniform(&local_rand_state)) / float(height);
+        ray r = (*cam)->get_ray(u, v);
+        col += color(r, world, &local_rand_state);
+    }
+    rand_state[pixelIndex] = local_rand_state;
+    col /= float(aa);
+    col[0] = sqrt(col[0]);
+    col[1] = sqrt(col[1]);
+    col[2] = sqrt(col[2]);
+    pixels[pixelIndex] = col;
+}
+
+__device__ vec3 color(const ray& r, hittable** world, curandState* local_rand_state) {
+    ray cur_ray = r;
+    vec3 cur_attenuation = vec3(1.0, 1.0, 1.0);
+    for (int i = 0; i < 50; i++) {
+        hit_record rec;
+        if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
+            ray scattered;
+            vec3 attenuation;
+            if (rec.mat_ptr->scatter(cur_ray, rec, attenuation, scattered, local_rand_state)) {
+                cur_attenuation *= attenuation;
+                cur_ray = scattered;
+            }
+            else {
+                return vec3();
+            }
+        }
+        else {
+            vec3 unit_direction = unit_vector(cur_ray.d);
+            float t = 0.5f * (unit_direction[1] + 1.0f);
+            vec3 c = (1.0f - t) * vec3(1.0, 1.0, 1.0) + t * vec3(0.5, 0.7, 1.0);
+            return cur_attenuation * c;
+        }
+    }
+    return vec3();
+}
+
+__global__ void create_world(hittable** d_list, hittable** d_world, camera** d_camera, int width, int height) {
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        d_list[0] = new sphere(vec3(0, 0, -1), 0.5,
+            new lambertian(vec3(0.1, 0.2, 0.5)));
+        d_list[1] = new sphere(vec3(0, -100.5, -1), 100,
+            new lambertian(vec3(0.8, 0.8, 0.0)));
+        d_list[2] = new sphere(vec3(1, 0, -1), 0.5,
+            new metal(vec3(0.8, 0.6, 0.2), 0.0));
+        d_list[3] = new sphere(vec3(-1, 0, -1), 0.5,
+            new dielectric(1.5));
+        d_list[4] = new sphere(vec3(-1, 0, -1), -0.45,
+            new dielectric(1.5));
+
+        *d_world = new hittable_list(d_list, num_objects);
+        *d_camera = new camera(vec3(-2, 2, 1), vec3(0, 0, -1), vec3(0, 1, 0), 20.0, float(width) / float(height));
+    }
+}
+
+__global__ void free_world(hittable** d_list, hittable** d_world, camera** d_camera) {
+    for (int i = 0; i < num_objects; i++) {
+        delete ((sphere*)d_list[i])->mat_ptr;
+        delete d_list[i];
+    }
+    delete *d_world;
+    delete* d_camera;
 }
 
 void check_cuda(cudaError_t result, char const* const func, const char* const file, int const line) {

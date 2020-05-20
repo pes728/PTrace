@@ -11,9 +11,6 @@ public:
 		e = r | (g << 8) | (b << 16) | (a << 24);
 	}
 
-	color(float r, float g, float b, float a) {
-		
-	}
 
 	uint8_t getR() { return (e & 0xFF000000) >> 24; }
 	uint8_t getG() { return (e & 0x00FF0000) >> 16; }
